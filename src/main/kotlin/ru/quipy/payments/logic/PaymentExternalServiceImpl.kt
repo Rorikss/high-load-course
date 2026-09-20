@@ -42,28 +42,29 @@ class PaymentExternalSystemAdapterImpl(
 
         val transactionId = UUID.randomUUID()
 
-        val acquired = try {
-            limiter.acquire(deadline)
-        } catch (e: InterruptedException) {
-            Thread.currentThread().interrupt()
-            false
-        }
-
-        if (!acquired) {
-            val submittedAt = now()
-            paymentESService.update(paymentId) {
-                it.logSubmission(false, transactionId, submittedAt, Duration.ofMillis(submittedAt - paymentStartedAt))
-            }
-            paymentESService.update(paymentId) {
-                it.logProcessing(false, now(), transactionId, reason = "Payment deadline exceeded before submission.")
-            }
-            return
-        }
-
+        var acquired = false
         try {
             val submittedAt = now()
             paymentESService.update(paymentId) {
                 it.logSubmission(true, transactionId, submittedAt, Duration.ofMillis(submittedAt - paymentStartedAt))
+            }
+
+            acquired = try {
+                limiter.acquire(deadline)
+            } catch (e: InterruptedException) {
+                Thread.currentThread().interrupt()
+                false
+            }
+
+            if (!acquired) {
+                val rejectedAt = now()
+                paymentESService.update(paymentId) {
+                    it.logSubmission(false, transactionId, rejectedAt, Duration.ofMillis(rejectedAt - paymentStartedAt))
+                }
+                paymentESService.update(paymentId) {
+                    it.logProcessing(false, now(), transactionId, reason = "Payment deadline exceeded before submission.")
+                }
+                return
             }
 
             logger.info("[$accountName] Submit: $paymentId , txId: $transactionId")
@@ -107,7 +108,7 @@ class PaymentExternalSystemAdapterImpl(
                 }
             }
         } finally {
-            limiter.release()
+            if (acquired) limiter.release()
         }
     }
 
