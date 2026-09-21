@@ -33,6 +33,7 @@ class PaymentExternalSystemAdapterImpl(
     private val requestAverageProcessingTime = properties.averageProcessingTime
     private val rateLimitPerSec = properties.rateLimitPerSec
     private val parallelRequests = properties.parallelRequests
+    private val limiter = PaymentAccountLimiter(parallelRequests, rateLimitPerSec, requestAverageProcessingTime)
 
     private val client = OkHttpClient.Builder().build()
 
@@ -41,15 +42,32 @@ class PaymentExternalSystemAdapterImpl(
 
         val transactionId = UUID.randomUUID()
 
-        // Вне зависимости от исхода оплаты важно отметить что она была отправлена.
-        // Это требуется сделать ВО ВСЕХ СЛУЧАЯХ, поскольку эта информация используется сервисом тестирования.
-        paymentESService.update(paymentId) {
-            it.logSubmission(success = true, transactionId, now(), Duration.ofMillis(now() - paymentStartedAt))
+        val acquired = try {
+            limiter.acquire(deadline)
+        } catch (e: InterruptedException) {
+            Thread.currentThread().interrupt()
+            false
         }
 
-        logger.info("[$accountName] Submit: $paymentId , txId: $transactionId")
+        if (!acquired) {
+            val submittedAt = now()
+            paymentESService.update(paymentId) {
+                it.logSubmission(false, transactionId, submittedAt, Duration.ofMillis(submittedAt - paymentStartedAt))
+            }
+            paymentESService.update(paymentId) {
+                it.logProcessing(false, now(), transactionId, reason = "Payment deadline exceeded before submission.")
+            }
+            return
+        }
 
         try {
+            val submittedAt = now()
+            paymentESService.update(paymentId) {
+                it.logSubmission(true, transactionId, submittedAt, Duration.ofMillis(submittedAt - paymentStartedAt))
+            }
+
+            logger.info("[$accountName] Submit: $paymentId , txId: $transactionId")
+
             val request = Request.Builder().run {
                 url("http://$paymentProviderHostPort/external/process?serviceName=$serviceName&token=$token&accountName=$accountName&transactionId=$transactionId&paymentId=$paymentId&amount=$amount")
                 post(emptyBody)
@@ -88,6 +106,8 @@ class PaymentExternalSystemAdapterImpl(
                     }
                 }
             }
+        } finally {
+            limiter.release()
         }
     }
 
