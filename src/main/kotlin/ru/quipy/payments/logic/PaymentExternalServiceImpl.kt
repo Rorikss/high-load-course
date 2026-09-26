@@ -6,6 +6,7 @@ import okhttp3.OkHttpClient
 import okhttp3.Request
 import okhttp3.RequestBody
 import org.slf4j.LoggerFactory
+import ru.quipy.common.utils.SlidingWindowRateLimiter
 import ru.quipy.core.EventSourcingService
 import ru.quipy.payments.api.PaymentAggregate
 import java.net.SocketTimeoutException
@@ -30,10 +31,8 @@ class PaymentExternalSystemAdapterImpl(
 
     private val serviceName = properties.serviceName
     private val accountName = properties.accountName
-    private val requestAverageProcessingTime = properties.averageProcessingTime
     private val rateLimitPerSec = properties.rateLimitPerSec
-    private val parallelRequests = properties.parallelRequests
-    private val limiter = PaymentAccountLimiter(parallelRequests, rateLimitPerSec, requestAverageProcessingTime)
+    private val rateLimiter = SlidingWindowRateLimiter(rateLimitPerSec.toLong(), Duration.ofSeconds(1))
 
     private val client = OkHttpClient.Builder().build()
 
@@ -42,25 +41,9 @@ class PaymentExternalSystemAdapterImpl(
 
         val transactionId = UUID.randomUUID()
 
-        val acquired = try {
-            limiter.acquire(deadline)
-        } catch (e: InterruptedException) {
-            Thread.currentThread().interrupt()
-            false
-        }
-
-        if (!acquired) {
-            val submittedAt = now()
-            paymentESService.update(paymentId) {
-                it.logSubmission(false, transactionId, submittedAt, Duration.ofMillis(submittedAt - paymentStartedAt))
-            }
-            paymentESService.update(paymentId) {
-                it.logProcessing(false, now(), transactionId, reason = "Payment deadline exceeded before submission.")
-            }
-            return
-        }
-
         try {
+            rateLimiter.tickBlocking()
+
             val submittedAt = now()
             paymentESService.update(paymentId) {
                 it.logSubmission(true, transactionId, submittedAt, Duration.ofMillis(submittedAt - paymentStartedAt))
@@ -106,8 +89,6 @@ class PaymentExternalSystemAdapterImpl(
                     }
                 }
             }
-        } finally {
-            limiter.release()
         }
     }
 
