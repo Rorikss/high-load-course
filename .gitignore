@@ -12,6 +12,9 @@ target/
 .settings
 .springBeans
 .sts4-cache
+grafana/
+prometheus/
+
 
 ### IntelliJ IDEA ###
 .idea
