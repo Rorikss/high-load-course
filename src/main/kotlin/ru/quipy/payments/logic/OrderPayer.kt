@@ -18,7 +18,7 @@ import java.util.concurrent.TimeUnit
 
 @Service
 class OrderPayer(
-    @Value("\${payment.queue-capacity:8000}") queueCapacity: Int,
+    @Value("\${payment.queue-capacity:13}") queueCapacity: Int,
     @Value("\${payment.service-name}") serviceName: String,
     meterRegistry: MeterRegistry,
 ) {
