@@ -14,6 +14,7 @@ import java.net.URI
 import java.net.http.HttpClient
 import java.net.http.HttpRequest
 import java.net.http.HttpResponse
+import java.time.Duration
 import java.util.*
 
 
@@ -35,6 +36,9 @@ class PaymentAccountsConfig {
 
     @Value("#{'\${payment.accounts}'.split(',')}")
     lateinit var allowedAccounts: List<String>
+
+    @Value("\${payment.admission.p99-window:5m}")
+    lateinit var admissionP99Window: Duration
 
     @Bean
     fun accountAdapters(
@@ -63,6 +67,7 @@ class PaymentAccountsConfig {
                     paymentProviderHostPort,
                     token,
                     meterRegistry,
+                    admissionP99Window,
                 )
             }
     }

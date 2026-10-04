@@ -13,6 +13,7 @@ import ru.quipy.payments.api.PaymentAggregate
 import java.time.Duration
 import java.util.*
 import java.util.concurrent.LinkedBlockingQueue
+import java.util.concurrent.RejectedExecutionException
 import java.util.concurrent.ThreadPoolExecutor
 import java.util.concurrent.TimeUnit
 
@@ -32,6 +33,9 @@ class OrderPayer(
 
     @Autowired
     private lateinit var paymentService: PaymentService
+
+    @Autowired
+    private lateinit var paymentAccounts: List<PaymentExternalSystemAdapter>
 
     init {
         require(queueCapacity > 0) { "payment.queue-capacity must be positive" }
@@ -60,19 +64,33 @@ class OrderPayer(
         .register(meterRegistry)
 
     fun processPayment(orderId: UUID, amount: Int, paymentId: UUID, deadline: Long, receivedAt: Long): Long {
-        paymentExecutor.submit {
-            queueWaitTimer.record(Duration.ofMillis(System.currentTimeMillis() - receivedAt))
+        val paymentAccount = paymentAccounts.single()
+        if (!paymentAccount.tryReserve(deadline)) {
+            throw RejectedExecutionException("Payment cannot be completed before deadline")
+        }
 
-            val createdEvent = paymentESService.create {
-                it.create(
-                    paymentId,
-                    orderId,
-                    amount
-                )
+        try {
+            paymentExecutor.submit {
+                try {
+                    queueWaitTimer.record(Duration.ofMillis(System.currentTimeMillis() - receivedAt))
+
+                    val createdEvent = paymentESService.create {
+                        it.create(
+                            paymentId,
+                            orderId,
+                            amount
+                        )
+                    }
+                    logger.trace("Payment ${createdEvent.paymentId} for order $orderId created.")
+
+                    paymentService.submitPaymentRequest(paymentId, amount, receivedAt, deadline)
+                } finally {
+                    paymentAccount.releaseReservation()
+                }
             }
-            logger.trace("Payment ${createdEvent.paymentId} for order $orderId created.")
-
-            paymentService.submitPaymentRequest(paymentId, amount, receivedAt, deadline)
+        } catch (e: RejectedExecutionException) {
+            paymentAccount.releaseReservation()
+            throw e
         }
         return receivedAt
     }

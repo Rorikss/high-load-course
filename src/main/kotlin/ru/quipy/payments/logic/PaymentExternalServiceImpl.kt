@@ -14,6 +14,8 @@ import ru.quipy.payments.api.PaymentAggregate
 import java.net.SocketTimeoutException
 import java.time.Duration
 import java.util.*
+import java.util.concurrent.TimeUnit
+import kotlin.math.ceil
 
 
 // Advice: always treat time as a Duration
@@ -23,6 +25,7 @@ class PaymentExternalSystemAdapterImpl(
     private val paymentProviderHostPort: String,
     private val token: String,
     meterRegistry: MeterRegistry,
+    private val admissionP99Window: Duration,
 ) : PaymentExternalSystemAdapter {
 
     companion object {
@@ -38,16 +41,33 @@ class PaymentExternalSystemAdapterImpl(
     private val rateLimitPerSec = properties.rateLimitPerSec
     private val parallelRequests = properties.parallelRequests
     private val limiter = PaymentAccountLimiter(parallelRequests, rateLimitPerSec, requestAverageProcessingTime)
+    private val startedAt = now()
     private val admittedCounter = admissionCounter(meterRegistry, "admitted")
     private val deadlineRejectedCounter = admissionCounter(meterRegistry, "deadline_rejected")
+    private val deadlineMissedCounter = admissionCounter(meterRegistry, "deadline_missed")
     private val limiterAdmittedWaitTimer = stageTimer(meterRegistry, "limiter_wait", "admitted")
-    private val limiterRejectedWaitTimer = stageTimer(meterRegistry, "limiter_wait", "deadline_rejected")
-    private val externalCallTimer = stageTimer(meterRegistry, "external_call", "finished")
+    private val limiterMissedWaitTimer = stageTimer(meterRegistry, "limiter_wait", "deadline_missed")
+    private val externalCallTimer = stageTimer(
+        meterRegistry,
+        "external_call",
+        "finished",
+        admissionP99Window,
+    )
     private val totalSuccessTimer = totalDurationTimer(meterRegistry, "success")
     private val totalFailedTimer = totalDurationTimer(meterRegistry, "failed")
-    private val totalDeadlineRejectedTimer = totalDurationTimer(meterRegistry, "deadline_rejected")
+    private val totalDeadlineMissedTimer = totalDurationTimer(meterRegistry, "deadline_missed")
 
     private val client = OkHttpClient.Builder().build()
+
+    override fun tryReserve(deadline: Long): Boolean {
+        val reserved = limiter.tryReserve(deadline, processingBudget())
+        if (reserved) admittedCounter.increment() else deadlineRejectedCounter.increment()
+        return reserved
+    }
+
+    override fun releaseReservation() {
+        limiter.releaseReservation()
+    }
 
     override fun performPaymentAsync(paymentId: UUID, amount: Int, paymentStartedAt: Long, deadline: Long) {
         logger.warn("[$accountName] Submitting payment request for payment $paymentId")
@@ -72,7 +92,7 @@ class PaymentExternalSystemAdapterImpl(
 
             val limiterStartedAt = now()
             acquired = try {
-                limiter.acquire(deadline)
+                limiter.acquire(deadline, processingBudget())
             } catch (e: InterruptedException) {
                 Thread.currentThread().interrupt()
                 false
@@ -80,8 +100,8 @@ class PaymentExternalSystemAdapterImpl(
             val limiterWait = Duration.ofMillis(now() - limiterStartedAt)
 
             if (!acquired) {
-                limiterRejectedWaitTimer.record(limiterWait)
-                deadlineRejectedCounter.increment()
+                limiterMissedWaitTimer.record(limiterWait)
+                deadlineMissedCounter.increment()
                 val rejectedAt = now()
                 paymentESService.update(paymentId) {
                     it.logSubmission(false, transactionId, rejectedAt, Duration.ofMillis(rejectedAt - paymentStartedAt))
@@ -89,12 +109,11 @@ class PaymentExternalSystemAdapterImpl(
                 paymentESService.update(paymentId) {
                     it.logProcessing(false, now(), transactionId, reason = "Payment deadline exceeded before submission.")
                 }
-                recordTotalDuration(totalDeadlineRejectedTimer)
+                recordTotalDuration(totalDeadlineMissedTimer)
                 return
             }
 
             limiterAdmittedWaitTimer.record(limiterWait)
-            admittedCounter.increment()
 
             logger.info("[$accountName] Submit: $paymentId , txId: $transactionId")
 
@@ -155,6 +174,20 @@ class PaymentExternalSystemAdapterImpl(
 
     override fun name() = properties.accountName
 
+    private fun processingBudget(): Duration {
+        val fallback = requestAverageProcessingTime.multipliedBy(2)
+        if (now() - startedAt < admissionP99Window.toMillis()) return fallback
+
+        val p99Millis = externalCallTimer.takeSnapshot()
+            .percentileValues()
+            .firstOrNull { it.percentile() == 0.99 }
+            ?.value(TimeUnit.MILLISECONDS)
+            ?.takeIf { it > 0.0 }
+            ?: return fallback
+
+        return Duration.ofMillis(ceil(p99Millis).toLong())
+    }
+
     private fun admissionCounter(meterRegistry: MeterRegistry, result: String): Counter =
         Counter.builder("payment.admission")
             .description("Payments admitted to or rejected by the account limiter")
@@ -163,8 +196,13 @@ class PaymentExternalSystemAdapterImpl(
             .tag("result", result)
             .register(meterRegistry)
 
-    private fun stageTimer(meterRegistry: MeterRegistry, stage: String, result: String): Timer =
-        Timer.builder("payment.stage.duration")
+    private fun stageTimer(
+        meterRegistry: MeterRegistry,
+        stage: String,
+        result: String,
+        percentileWindow: Duration? = null,
+    ): Timer {
+        val builder = Timer.builder("payment.stage.duration")
             .description("Duration of a payment processing stage")
             .tags(
                 "service", serviceName,
@@ -174,7 +212,16 @@ class PaymentExternalSystemAdapterImpl(
             )
             .publishPercentileHistogram()
             .serviceLevelObjectives(*durationBuckets())
-            .register(meterRegistry)
+
+        if (percentileWindow != null) {
+            builder
+                .publishPercentiles(0.99)
+                .distributionStatisticExpiry(percentileWindow)
+                .distributionStatisticBufferLength(1)
+        }
+
+        return builder.register(meterRegistry)
+    }
 
     private fun totalDurationTimer(meterRegistry: MeterRegistry, result: String): Timer =
         Timer.builder("payment.total.duration")
