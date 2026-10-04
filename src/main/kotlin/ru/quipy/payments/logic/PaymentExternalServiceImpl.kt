@@ -2,6 +2,9 @@ package ru.quipy.payments.logic
 
 import com.fasterxml.jackson.databind.ObjectMapper
 import com.fasterxml.jackson.module.kotlin.registerKotlinModule
+import io.micrometer.core.instrument.Counter
+import io.micrometer.core.instrument.MeterRegistry
+import io.micrometer.core.instrument.Timer
 import okhttp3.OkHttpClient
 import okhttp3.Request
 import okhttp3.RequestBody
@@ -11,6 +14,8 @@ import ru.quipy.payments.api.PaymentAggregate
 import java.net.SocketTimeoutException
 import java.time.Duration
 import java.util.*
+import java.util.concurrent.TimeUnit
+import kotlin.math.ceil
 
 
 // Advice: always treat time as a Duration
@@ -19,6 +24,8 @@ class PaymentExternalSystemAdapterImpl(
     private val paymentESService: EventSourcingService<UUID, PaymentAggregate, PaymentAggregateState>,
     private val paymentProviderHostPort: String,
     private val token: String,
+    meterRegistry: MeterRegistry,
+    private val admissionP99Window: Duration,
 ) : PaymentExternalSystemAdapter {
 
     companion object {
@@ -34,8 +41,33 @@ class PaymentExternalSystemAdapterImpl(
     private val rateLimitPerSec = properties.rateLimitPerSec
     private val parallelRequests = properties.parallelRequests
     private val limiter = PaymentAccountLimiter(parallelRequests, rateLimitPerSec, requestAverageProcessingTime)
+    private val startedAt = now()
+    private val admittedCounter = admissionCounter(meterRegistry, "admitted")
+    private val deadlineRejectedCounter = admissionCounter(meterRegistry, "deadline_rejected")
+    private val deadlineMissedCounter = admissionCounter(meterRegistry, "deadline_missed")
+    private val limiterAdmittedWaitTimer = stageTimer(meterRegistry, "limiter_wait", "admitted")
+    private val limiterMissedWaitTimer = stageTimer(meterRegistry, "limiter_wait", "deadline_missed")
+    private val externalCallTimer = stageTimer(
+        meterRegistry,
+        "external_call",
+        "finished",
+        admissionP99Window,
+    )
+    private val totalSuccessTimer = totalDurationTimer(meterRegistry, "success")
+    private val totalFailedTimer = totalDurationTimer(meterRegistry, "failed")
+    private val totalDeadlineMissedTimer = totalDurationTimer(meterRegistry, "deadline_missed")
 
     private val client = OkHttpClient.Builder().build()
+
+    override fun tryReserve(deadline: Long): Boolean {
+        val reserved = limiter.tryReserve(deadline, processingBudget())
+        if (reserved) admittedCounter.increment() else deadlineRejectedCounter.increment()
+        return reserved
+    }
+
+    override fun releaseReservation() {
+        limiter.releaseReservation()
+    }
 
     override fun performPaymentAsync(paymentId: UUID, amount: Int, paymentStartedAt: Long, deadline: Long) {
         logger.warn("[$accountName] Submitting payment request for payment $paymentId")
@@ -43,20 +75,33 @@ class PaymentExternalSystemAdapterImpl(
         val transactionId = UUID.randomUUID()
 
         var acquired = false
+        var totalDurationRecorded = false
+
+        fun recordTotalDuration(timer: Timer) {
+            if (!totalDurationRecorded) {
+                timer.record(Duration.ofMillis(now() - paymentStartedAt))
+                totalDurationRecorded = true
+            }
+        }
+
         try {
             val submittedAt = now()
             paymentESService.update(paymentId) {
                 it.logSubmission(true, transactionId, submittedAt, Duration.ofMillis(submittedAt - paymentStartedAt))
             }
 
+            val limiterStartedAt = now()
             acquired = try {
-                limiter.acquire(deadline)
+                limiter.acquire(deadline, processingBudget())
             } catch (e: InterruptedException) {
                 Thread.currentThread().interrupt()
                 false
             }
+            val limiterWait = Duration.ofMillis(now() - limiterStartedAt)
 
             if (!acquired) {
+                limiterMissedWaitTimer.record(limiterWait)
+                deadlineMissedCounter.increment()
                 val rejectedAt = now()
                 paymentESService.update(paymentId) {
                     it.logSubmission(false, transactionId, rejectedAt, Duration.ofMillis(rejectedAt - paymentStartedAt))
@@ -64,8 +109,11 @@ class PaymentExternalSystemAdapterImpl(
                 paymentESService.update(paymentId) {
                     it.logProcessing(false, now(), transactionId, reason = "Payment deadline exceeded before submission.")
                 }
+                recordTotalDuration(totalDeadlineMissedTimer)
                 return
             }
+
+            limiterAdmittedWaitTimer.record(limiterWait)
 
             logger.info("[$accountName] Submit: $paymentId , txId: $transactionId")
 
@@ -74,11 +122,17 @@ class PaymentExternalSystemAdapterImpl(
                 post(emptyBody)
             }.build()
 
-            client.newCall(request).execute().use { response ->
+            val externalStartedAt = now()
+            val response = try {
+                client.newCall(request).execute()
+            } finally {
+                externalCallTimer.record(Duration.ofMillis(now() - externalStartedAt))
+            }
+            response.use {
                 val body = try {
-                    mapper.readValue(response.body?.string(), ExternalSysResponse::class.java)
+                    mapper.readValue(it.body?.string(), ExternalSysResponse::class.java)
                 } catch (e: Exception) {
-                    logger.error("[$accountName] [ERROR] Payment processed for txId: $transactionId, payment: $paymentId, result code: ${response.code}, reason: ${response.body?.string()}")
+                    logger.error("[$accountName] [ERROR] Payment processed for txId: $transactionId, payment: $paymentId, result code: ${it.code}, reason: ${it.body?.string()}")
                     ExternalSysResponse(transactionId.toString(), paymentId.toString(),false, e.message)
                 }
 
@@ -89,8 +143,10 @@ class PaymentExternalSystemAdapterImpl(
                 paymentESService.update(paymentId) {
                     it.logProcessing(body.result, now(), transactionId, reason = body.message)
                 }
+                recordTotalDuration(if (body.result) totalSuccessTimer else totalFailedTimer)
             }
         } catch (e: Exception) {
+            recordTotalDuration(totalFailedTimer)
             when (e) {
                 is SocketTimeoutException -> {
                     logger.error("[$accountName] Payment timeout for txId: $transactionId, payment: $paymentId", e)
@@ -117,6 +173,79 @@ class PaymentExternalSystemAdapterImpl(
     override fun isEnabled() = properties.enabled
 
     override fun name() = properties.accountName
+
+    private fun processingBudget(): Duration {
+        val fallback = requestAverageProcessingTime.multipliedBy(2)
+        if (now() - startedAt < admissionP99Window.toMillis()) return fallback
+
+        val p99Millis = externalCallTimer.takeSnapshot()
+            .percentileValues()
+            .firstOrNull { it.percentile() == 0.99 }
+            ?.value(TimeUnit.MILLISECONDS)
+            ?.takeIf { it > 0.0 }
+            ?: return fallback
+
+        return Duration.ofMillis(ceil(p99Millis).toLong())
+    }
+
+    private fun admissionCounter(meterRegistry: MeterRegistry, result: String): Counter =
+        Counter.builder("payment.admission")
+            .description("Payments admitted to or rejected by the account limiter")
+            .tag("service", serviceName)
+            .tag("account", accountName)
+            .tag("result", result)
+            .register(meterRegistry)
+
+    private fun stageTimer(
+        meterRegistry: MeterRegistry,
+        stage: String,
+        result: String,
+        percentileWindow: Duration? = null,
+    ): Timer {
+        val builder = Timer.builder("payment.stage.duration")
+            .description("Duration of a payment processing stage")
+            .tags(
+                "service", serviceName,
+                "account", accountName,
+                "stage", stage,
+                "result", result,
+            )
+            .publishPercentileHistogram()
+            .serviceLevelObjectives(*durationBuckets())
+
+        if (percentileWindow != null) {
+            builder
+                .publishPercentiles(0.99)
+                .distributionStatisticExpiry(percentileWindow)
+                .distributionStatisticBufferLength(1)
+        }
+
+        return builder.register(meterRegistry)
+    }
+
+    private fun totalDurationTimer(meterRegistry: MeterRegistry, result: String): Timer =
+        Timer.builder("payment.total.duration")
+            .description("Time from accepting a payment request to its terminal result")
+            .tags(
+                "service", serviceName,
+                "account", accountName,
+                "result", result,
+            )
+            .publishPercentileHistogram()
+            .serviceLevelObjectives(*durationBuckets())
+            .register(meterRegistry)
+
+    private fun durationBuckets(): Array<Duration> = arrayOf(
+        Duration.ofMillis(100),
+        Duration.ofSeconds(1),
+        Duration.ofSeconds(5),
+        Duration.ofSeconds(10),
+        Duration.ofSeconds(20),
+        Duration.ofSeconds(30),
+        Duration.ofSeconds(40),
+        Duration.ofSeconds(50),
+        Duration.ofSeconds(60),
+    )
 
 }
 

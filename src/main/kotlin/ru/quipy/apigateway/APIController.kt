@@ -60,10 +60,11 @@ class APIController {
 
     @PostMapping("/orders/{orderId}/payment")
     fun payOrder(@PathVariable orderId: UUID, @RequestParam deadline: Long): ResponseEntity<Any> {
+        val receivedAt = System.currentTimeMillis()
         val paymentId = UUID.randomUUID()
         val order = orderRepository.findById(orderId) ?: throw IllegalArgumentException("No such order $orderId")
         val createdAt = try {
-            orderPayer.processPayment(orderId, order.price, paymentId, deadline)
+            orderPayer.processPayment(orderId, order.price, paymentId, deadline, receivedAt)
         } catch (e: RejectedExecutionException) {
             val retryAt = System.currentTimeMillis() + 1_000
             return ResponseEntity.status(HttpStatus.TOO_MANY_REQUESTS)
