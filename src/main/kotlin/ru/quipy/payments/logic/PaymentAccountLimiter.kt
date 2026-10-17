@@ -4,6 +4,7 @@ import ru.quipy.common.utils.OngoingWindow
 import ru.quipy.common.utils.SlidingWindowRateLimiter
 import java.time.Duration
 import java.util.concurrent.atomic.AtomicInteger
+import kotlin.math.ceil
 
 class PaymentAccountLimiter(
     private val parallelRequests: Int,
@@ -14,13 +15,15 @@ class PaymentAccountLimiter(
     private val rateLimiter = SlidingWindowRateLimiter(rateLimitPerSec.toLong(), Duration.ofSeconds(1))
     private val pendingRequests = AtomicInteger()
 
-    fun tryReserve(deadline: Long, processingBudget: Duration): Boolean {
+    fun tryReserve(deadline: Long, processingBudget: Duration, executorParallelism: Int): Boolean {
+        val effectiveParallelism = minOf(parallelRequests, executorParallelism)
+        val processingMillis = processingBudget.toMillis().toDouble()
+        val throughputPerMillis = minOf(rateLimitPerSec / 1_000.0, effectiveParallelism / processingMillis)
         while (true) {
             val pending = pendingRequests.get()
-            val parallelDelayMillis = (pending / parallelRequests) * processingBudget.toMillis()
-            val rateDelayMillis = (pending / rateLimitPerSec) * 1_000L
+            val waitingMillis = maxOf(0.0, (pending + 1) / throughputPerMillis - processingMillis)
             val estimatedFinish = System.currentTimeMillis() +
-                maxOf(parallelDelayMillis, rateDelayMillis) +
+                ceil(waitingMillis).toLong() +
                 processingBudget.toMillis()
 
             if (estimatedFinish >= deadline) return false

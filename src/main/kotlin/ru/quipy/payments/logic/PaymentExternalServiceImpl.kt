@@ -59,8 +59,8 @@ class PaymentExternalSystemAdapterImpl(
 
     private val client = OkHttpClient.Builder().build()
 
-    override fun tryReserve(deadline: Long): Boolean {
-        val reserved = limiter.tryReserve(deadline, processingBudget())
+    override fun tryReserve(deadline: Long, executorParallelism: Int): Boolean {
+        val reserved = limiter.tryReserve(deadline, processingBudget(), executorParallelism)
         if (reserved) admittedCounter.increment() else deadlineRejectedCounter.increment()
         return reserved
     }

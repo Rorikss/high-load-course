@@ -1,5 +1,6 @@
 package ru.quipy.payments.logic
 
+import io.micrometer.core.instrument.Gauge
 import io.micrometer.core.instrument.MeterRegistry
 import io.micrometer.core.instrument.Timer
 import org.slf4j.Logger
@@ -19,7 +20,7 @@ import java.util.concurrent.TimeUnit
 
 @Service
 class OrderPayer(
-    @Value("\${payment.queue-capacity:13}") queueCapacity: Int,
+    @Value("\${payment.queue-capacity:8000}") queueCapacity: Int,
     @Value("\${payment.service-name}") serviceName: String,
     meterRegistry: MeterRegistry,
 ) {
@@ -42,14 +43,21 @@ class OrderPayer(
     }
 
     private val paymentExecutor = ThreadPoolExecutor(
-        16,
-        16,
+        110,
+        110,
         0L,
         TimeUnit.MILLISECONDS,
         LinkedBlockingQueue(queueCapacity),
         NamedThreadFactory("payment-submission-executor"),
         ThreadPoolExecutor.AbortPolicy()
     )
+
+    init {
+        Gauge.builder("payment.executor.queue.size", paymentExecutor) { it.queue.size.toDouble() }
+            .description("Number of payment tasks waiting in the executor queue")
+            .tag("service", serviceName)
+            .register(meterRegistry)
+    }
 
     private val queueWaitTimer = Timer.builder("payment.stage.duration")
         .description("Duration of a payment processing stage")
@@ -65,7 +73,7 @@ class OrderPayer(
 
     fun processPayment(orderId: UUID, amount: Int, paymentId: UUID, deadline: Long, receivedAt: Long): Long {
         val paymentAccount = paymentAccounts.single()
-        if (!paymentAccount.tryReserve(deadline)) {
+        if (!paymentAccount.tryReserve(deadline, paymentExecutor.maximumPoolSize)) {
             throw RejectedExecutionException("Payment cannot be completed before deadline")
         }
 
