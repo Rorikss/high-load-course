@@ -22,8 +22,9 @@ class PaymentAccountLimiter(
         while (true) {
             val pending = pendingRequests.get()
             val waitingMillis = maxOf(0.0, (pending + 1) / throughputPerMillis - processingMillis)
+            val waitingSafetyMarginMillis = if (pending >= effectiveParallelism) 1.0 / throughputPerMillis else 0.0
             val estimatedFinish = System.currentTimeMillis() +
-                ceil(waitingMillis).toLong() +
+                ceil(waitingMillis + waitingSafetyMarginMillis).toLong() +
                 processingBudget.toMillis()
 
             if (estimatedFinish >= deadline) return false
@@ -43,7 +44,7 @@ class PaymentAccountLimiter(
 
         var acquired = false
         try {
-            rateLimiter.tickBlocking()
+            if (!rateLimiter.tickBlocking(latestStart)) return false
             acquired = System.currentTimeMillis() < latestStart
             return acquired
         } finally {
