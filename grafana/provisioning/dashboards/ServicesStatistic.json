@@ -3717,6 +3717,84 @@
       ],
       "title": "Lab 3 analysis",
       "type": "row"
+    },
+    {
+      "collapsed": true,
+      "gridPos": {
+        "h": 1,
+        "w": 24,
+        "x": 0,
+        "y": 8
+      },
+      "id": 105,
+      "panels": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "PBFA97CFB590B2093"
+          },
+          "description": "Number of payment tasks waiting in the executor queue; excludes running tasks.",
+          "fieldConfig": {
+            "defaults": {
+              "color": {
+                "mode": "palette-classic"
+              },
+              "custom": {
+                "drawStyle": "line",
+                "fillOpacity": 10,
+                "lineInterpolation": "stepAfter",
+                "lineWidth": 2,
+                "showPoints": "never",
+                "spanNulls": false
+              },
+              "decimals": 0,
+              "min": 0,
+              "unit": "short"
+            },
+            "overrides": []
+          },
+          "gridPos": {
+            "h": 8,
+            "w": 24,
+            "x": 0,
+            "y": 9
+          },
+          "id": 106,
+          "options": {
+            "legend": {
+              "calcs": [
+                "lastNotNull",
+                "max"
+              ],
+              "displayMode": "table",
+              "placement": "right",
+              "showLegend": true
+            },
+            "tooltip": {
+              "mode": "multi",
+              "sort": "desc"
+            }
+          },
+          "pluginVersion": "11.4.0",
+          "targets": [
+            {
+              "datasource": {
+                "type": "prometheus",
+                "uid": "PBFA97CFB590B2093"
+              },
+              "editorMode": "code",
+              "expr": "max by (service) (payment_executor_queue_size{service=~\"$service\"})",
+              "legendFormat": "{{service}}",
+              "range": true,
+              "refId": "A"
+            }
+          ],
+          "title": "Payment executor queue size",
+          "type": "timeseries"
+        }
+      ],
+      "title": "Lab4",
+      "type": "row"
     }
   ],
   "preload": false,
