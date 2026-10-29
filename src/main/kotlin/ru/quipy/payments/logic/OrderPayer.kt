@@ -23,6 +23,7 @@ class OrderPayer(
     @Value("\${payment.queue-capacity:8000}") queueCapacity: Int,
     @Value("\${payment.service-name}") serviceName: String,
     meterRegistry: MeterRegistry,
+    @Value("\${payment.admission.p99-window:5m}") p99Window: Duration,
 ) {
 
     companion object {
@@ -71,14 +72,25 @@ class OrderPayer(
         .serviceLevelObjectives(*durationBuckets())
         .register(meterRegistry)
 
+    private val workerBusyTimer = Timer.builder("payment.stage.duration")
+        .description("Time a worker is occupied, excluding the executor queue")
+        .tags("service", serviceName, "account", "all", "stage", "worker_busy", "result", "finished")
+        .publishPercentileHistogram()
+        .publishPercentiles(0.99)
+        .distributionStatisticExpiry(p99Window)
+        .distributionStatisticBufferLength(1)
+        .serviceLevelObjectives(*durationBuckets())
+        .register(meterRegistry)
+
     fun processPayment(orderId: UUID, amount: Int, paymentId: UUID, deadline: Long, receivedAt: Long): Long {
         val paymentAccount = paymentAccounts.single()
-        if (!paymentAccount.tryReserve(deadline, paymentExecutor.maximumPoolSize)) {
+        if (!paymentAccount.tryReserve(paymentId, deadline, paymentExecutor.maximumPoolSize)) {
             throw RejectedExecutionException("Payment cannot be completed before deadline")
         }
 
         try {
             paymentExecutor.submit {
+                val workerStartedAt = System.nanoTime()
                 try {
                     queueWaitTimer.record(Duration.ofMillis(System.currentTimeMillis() - receivedAt))
 
@@ -93,11 +105,12 @@ class OrderPayer(
 
                     paymentService.submitPaymentRequest(paymentId, amount, receivedAt, deadline)
                 } finally {
-                    paymentAccount.releaseReservation()
+                    workerBusyTimer.record(System.nanoTime() - workerStartedAt, TimeUnit.NANOSECONDS)
+                    paymentAccount.releaseReservation(paymentId)
                 }
             }
         } catch (e: RejectedExecutionException) {
-            paymentAccount.releaseReservation()
+            paymentAccount.releaseReservation(paymentId)
             throw e
         }
         return receivedAt

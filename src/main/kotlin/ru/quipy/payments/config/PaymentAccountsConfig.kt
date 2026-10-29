@@ -40,6 +40,9 @@ class PaymentAccountsConfig {
     @Value("\${payment.admission.p99-window:5m}")
     lateinit var admissionP99Window: Duration
 
+    @Value("\${payment.rps-window-margin:4ms}")
+    lateinit var rpsWindowMargin: Duration
+
     @Bean
     fun accountAdapters(
         paymentService: EventSourcingService<UUID, PaymentAggregate, PaymentAggregateState>,
@@ -68,6 +71,7 @@ class PaymentAccountsConfig {
                     token,
                     meterRegistry,
                     admissionP99Window,
+                    rpsWindowMargin,
                 )
             }
     }

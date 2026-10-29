@@ -3,6 +3,7 @@ package ru.quipy.apigateway
 import org.slf4j.Logger
 import org.slf4j.LoggerFactory
 import org.springframework.beans.factory.annotation.Autowired
+import org.springframework.beans.factory.annotation.Value
 import org.springframework.http.HttpHeaders
 import org.springframework.http.HttpStatus
 import org.springframework.http.ResponseEntity
@@ -14,6 +15,9 @@ import java.util.concurrent.RejectedExecutionException
 
 @RestController
 class APIController {
+
+    @Value("\${payment.retry-delay-millis:1000}")
+    private var retryDelayMillis: Long = 1000
 
     val logger: Logger = LoggerFactory.getLogger(APIController::class.java)
 
@@ -66,7 +70,7 @@ class APIController {
         val createdAt = try {
             orderPayer.processPayment(orderId, order.price, paymentId, deadline, receivedAt)
         } catch (e: RejectedExecutionException) {
-            val retryAt = System.currentTimeMillis() + 1_000
+            val retryAt = System.currentTimeMillis() + retryDelayMillis
             return ResponseEntity.status(HttpStatus.TOO_MANY_REQUESTS)
                 .header(HttpHeaders.RETRY_AFTER, retryAt.toString())
                 .build()
