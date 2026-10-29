@@ -17,7 +17,7 @@ interface PaymentService {
 
  */
 interface PaymentExternalSystemAdapter {
-    fun tryReserve(deadline: Long): Boolean
+    fun tryReserve(deadline: Long, executorParallelism: Int): Boolean
 
     fun releaseReservation()
 
