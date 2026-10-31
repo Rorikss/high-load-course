@@ -24,8 +24,10 @@ class PaymentExternalSystemAdapterImpl(
     private val paymentESService: EventSourcingService<UUID, PaymentAggregate, PaymentAggregateState>,
     private val paymentProviderHostPort: String,
     private val token: String,
-    meterRegistry: MeterRegistry,
+    private val meterRegistry: MeterRegistry,
     private val admissionP99Window: Duration,
+    private val rpsWindowMargin: Duration = Duration.ZERO,
+    priorityArrivalWindow: Duration = Duration.ZERO,
 ) : PaymentExternalSystemAdapter {
 
     companion object {
@@ -40,7 +42,7 @@ class PaymentExternalSystemAdapterImpl(
     private val requestAverageProcessingTime = properties.averageProcessingTime
     private val rateLimitPerSec = properties.rateLimitPerSec
     private val parallelRequests = properties.parallelRequests
-    private val limiter = PaymentAccountLimiter(parallelRequests, rateLimitPerSec, requestAverageProcessingTime)
+    private val limiter = PaymentAccountLimiter(parallelRequests, rateLimitPerSec, rpsWindowMargin, priorityArrivalWindow)
     private val startedAt = now()
     private val admittedCounter = admissionCounter(meterRegistry, "admitted")
     private val deadlineRejectedCounter = admissionCounter(meterRegistry, "deadline_rejected")
@@ -59,14 +61,16 @@ class PaymentExternalSystemAdapterImpl(
 
     private val client = OkHttpClient.Builder().build()
 
-    override fun tryReserve(deadline: Long, executorParallelism: Int): Boolean {
-        val reserved = limiter.tryReserve(deadline, processingBudget(), executorParallelism)
+    override fun tryReserve(paymentId: UUID, deadline: Long, executorParallelism: Int, amount: Int, receivedAt: Long): Boolean {
+        val externalBudget = processingBudget()
+        val workerTail = workerBudget(externalBudget, executorParallelism)
+        val reserved = limiter.tryReserve(paymentId, deadline, externalBudget, executorParallelism, workerTail, workerMean(), amount, receivedAt)
         if (reserved) admittedCounter.increment() else deadlineRejectedCounter.increment()
         return reserved
     }
 
-    override fun releaseReservation() {
-        limiter.releaseReservation()
+    override fun releaseReservation(paymentId: UUID) {
+        limiter.releaseReservation(paymentId)
     }
 
     override fun performPaymentAsync(paymentId: UUID, amount: Int, paymentStartedAt: Long, deadline: Long) {
@@ -92,7 +96,7 @@ class PaymentExternalSystemAdapterImpl(
 
             val limiterStartedAt = now()
             acquired = try {
-                limiter.acquire(deadline, processingBudget())
+                limiter.acquire(paymentId)
             } catch (e: InterruptedException) {
                 Thread.currentThread().interrupt()
                 false
@@ -173,6 +177,27 @@ class PaymentExternalSystemAdapterImpl(
     override fun isEnabled() = properties.enabled
 
     override fun name() = properties.accountName
+
+    private fun workerMean(): Duration {
+        val timer = meterRegistry.find("payment.stage.duration")
+            .tags("service", serviceName, "account", "all", "stage", "worker_busy", "result", "finished")
+            .timer() ?: return requestAverageProcessingTime
+        val meanMillis = timer.mean(TimeUnit.MILLISECONDS).takeIf { it.isFinite() && it > 0.0 } ?: return requestAverageProcessingTime
+        return Duration.ofMillis(ceil(meanMillis).toLong())
+    }
+
+    private fun workerBudget(externalBudget: Duration, executorParallelism: Int): Duration {
+        val rpsWindows = ceil(executorParallelism.toDouble() / rateLimitPerSec).toLong()
+        val fallback = externalBudget.plus(Duration.ofSeconds(1).plus(rpsWindowMargin).multipliedBy(rpsWindows))
+        if (now() - startedAt < admissionP99Window.toMillis()) return fallback
+        val timer = meterRegistry.find("payment.stage.duration")
+            .tags("service", serviceName, "account", "all", "stage", "worker_busy", "result", "finished")
+            .timer() ?: return fallback
+        val p99Millis = timer.takeSnapshot().percentileValues()
+            .firstOrNull { it.percentile() == 0.99 }
+            ?.value(TimeUnit.MILLISECONDS)?.takeIf { it > 0.0 } ?: return fallback
+        return maxOf(externalBudget, Duration.ofMillis(ceil(p99Millis).toLong()))
+    }
 
     private fun processingBudget(): Duration {
         val fallback = requestAverageProcessingTime.multipliedBy(2)
