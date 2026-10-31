@@ -63,7 +63,7 @@ class PaymentExternalSystemAdapterImpl(
     override fun tryReserve(paymentId: UUID, deadline: Long, executorParallelism: Int): Boolean {
         val externalBudget = processingBudget()
         val workerTail = workerBudget(externalBudget, executorParallelism)
-        val reserved = limiter.tryReserve(paymentId, deadline, externalBudget, executorParallelism, workerTail, workerMean(workerTail))
+        val reserved = limiter.tryReserve(paymentId, deadline, externalBudget, executorParallelism, workerTail, workerMean())
         if (reserved) admittedCounter.increment() else deadlineRejectedCounter.increment()
         return reserved
     }
@@ -177,12 +177,11 @@ class PaymentExternalSystemAdapterImpl(
 
     override fun name() = properties.accountName
 
-    private fun workerMean(fallback: Duration): Duration {
-        if (now() - startedAt < admissionP99Window.toMillis()) return fallback
+    private fun workerMean(): Duration {
         val timer = meterRegistry.find("payment.stage.duration")
             .tags("service", serviceName, "account", "all", "stage", "worker_busy", "result", "finished")
-            .timer() ?: return fallback
-        val meanMillis = timer.mean(TimeUnit.MILLISECONDS).takeIf { it.isFinite() && it > 0.0 } ?: return fallback
+            .timer() ?: return requestAverageProcessingTime
+        val meanMillis = timer.mean(TimeUnit.MILLISECONDS).takeIf { it.isFinite() && it > 0.0 } ?: return requestAverageProcessingTime
         return Duration.ofMillis(ceil(meanMillis).toLong())
     }
 
