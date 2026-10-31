@@ -85,7 +85,7 @@ class OrderPayer(
     @Synchronized
     fun processPayment(orderId: UUID, amount: Int, paymentId: UUID, deadline: Long, receivedAt: Long): Long {
         val paymentAccount = paymentAccounts.single()
-        if (!paymentAccount.tryReserve(paymentId, deadline, paymentExecutor.maximumPoolSize)) {
+        if (!paymentAccount.tryReserve(paymentId, deadline, paymentExecutor.maximumPoolSize, amount, receivedAt)) {
             throw RejectedExecutionException("Payment cannot be completed before deadline")
         }
 
