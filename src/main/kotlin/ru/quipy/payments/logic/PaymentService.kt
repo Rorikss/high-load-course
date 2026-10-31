@@ -17,7 +17,7 @@ interface PaymentService {
 
  */
 interface PaymentExternalSystemAdapter {
-    fun tryReserve(paymentId: UUID, deadline: Long, executorParallelism: Int): Boolean
+    fun tryReserve(paymentId: UUID, deadline: Long, executorParallelism: Int, amount: Int, receivedAt: Long): Boolean
 
     fun releaseReservation(paymentId: UUID)
 

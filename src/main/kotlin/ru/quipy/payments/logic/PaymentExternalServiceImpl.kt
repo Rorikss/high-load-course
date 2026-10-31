@@ -27,6 +27,7 @@ class PaymentExternalSystemAdapterImpl(
     private val meterRegistry: MeterRegistry,
     private val admissionP99Window: Duration,
     private val rpsWindowMargin: Duration = Duration.ZERO,
+    priorityArrivalWindow: Duration = Duration.ZERO,
 ) : PaymentExternalSystemAdapter {
 
     companion object {
@@ -41,7 +42,7 @@ class PaymentExternalSystemAdapterImpl(
     private val requestAverageProcessingTime = properties.averageProcessingTime
     private val rateLimitPerSec = properties.rateLimitPerSec
     private val parallelRequests = properties.parallelRequests
-    private val limiter = PaymentAccountLimiter(parallelRequests, rateLimitPerSec, rpsWindowMargin)
+    private val limiter = PaymentAccountLimiter(parallelRequests, rateLimitPerSec, rpsWindowMargin, priorityArrivalWindow)
     private val startedAt = now()
     private val admittedCounter = admissionCounter(meterRegistry, "admitted")
     private val deadlineRejectedCounter = admissionCounter(meterRegistry, "deadline_rejected")
@@ -60,10 +61,10 @@ class PaymentExternalSystemAdapterImpl(
 
     private val client = OkHttpClient.Builder().build()
 
-    override fun tryReserve(paymentId: UUID, deadline: Long, executorParallelism: Int): Boolean {
+    override fun tryReserve(paymentId: UUID, deadline: Long, executorParallelism: Int, amount: Int, receivedAt: Long): Boolean {
         val externalBudget = processingBudget()
         val workerTail = workerBudget(externalBudget, executorParallelism)
-        val reserved = limiter.tryReserve(paymentId, deadline, externalBudget, executorParallelism, workerTail, workerMean())
+        val reserved = limiter.tryReserve(paymentId, deadline, externalBudget, executorParallelism, workerTail, workerMean(), amount, receivedAt)
         if (reserved) admittedCounter.increment() else deadlineRejectedCounter.increment()
         return reserved
     }
