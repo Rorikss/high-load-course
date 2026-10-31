@@ -82,6 +82,7 @@ class OrderPayer(
         .serviceLevelObjectives(*durationBuckets())
         .register(meterRegistry)
 
+    @Synchronized
     fun processPayment(orderId: UUID, amount: Int, paymentId: UUID, deadline: Long, receivedAt: Long): Long {
         val paymentAccount = paymentAccounts.single()
         if (!paymentAccount.tryReserve(paymentId, deadline, paymentExecutor.maximumPoolSize)) {
