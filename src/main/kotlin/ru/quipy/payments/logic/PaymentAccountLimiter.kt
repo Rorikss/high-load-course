@@ -112,6 +112,9 @@ class PaymentAccountLimiter(
     }
 
     @Synchronized
+    fun waitingCount(): Int = readyPayments.size
+
+    @Synchronized
     fun release() {
         check(executingPayments > 0)
         executingPayments--
