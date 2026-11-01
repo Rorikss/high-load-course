@@ -15,6 +15,7 @@ import org.slf4j.LoggerFactory
 import ru.quipy.core.EventSourcingService
 import ru.quipy.payments.api.PaymentAggregate
 import java.io.IOException
+import java.net.ProtocolException
 import java.net.SocketTimeoutException
 import java.time.Duration
 import java.util.*
@@ -32,6 +33,7 @@ class PaymentExternalSystemAdapterImpl(
     private val admissionP99Window: Duration,
     private val rpsWindowMargin: Duration = Duration.ZERO,
     priorityArrivalWindow: Duration = Duration.ZERO,
+    burstCapacity: Int = 6,
 ) : PaymentExternalSystemAdapter {
 
     companion object {
@@ -46,7 +48,7 @@ class PaymentExternalSystemAdapterImpl(
     private val requestAverageProcessingTime = properties.averageProcessingTime
     private val rateLimitPerSec = properties.rateLimitPerSec
     private val parallelRequests = properties.parallelRequests
-    private val limiter = PaymentAccountLimiter(parallelRequests, rateLimitPerSec, rpsWindowMargin, priorityArrivalWindow)
+    private val limiter = PaymentAccountLimiter(parallelRequests, rateLimitPerSec, rpsWindowMargin, priorityArrivalWindow, burstCapacity)
     private val startedAt = now()
     private val admittedCounter = admissionCounter(meterRegistry, "admitted")
     private val deadlineRejectedCounter = admissionCounter(meterRegistry, "deadline_rejected")
@@ -77,6 +79,7 @@ class PaymentExternalSystemAdapterImpl(
         .tags("service", serviceName, "account", accountName).register(meterRegistry)
 
     private val client = OkHttpClient.Builder()
+        .retryOnConnectionFailure(false)
         .eventListener(object : EventListener() {
             override fun requestHeadersEnd(call: Call, request: Request) {
                 val attempt = request.tag(PaymentAttempt::class.java) ?: return
@@ -86,6 +89,7 @@ class PaymentExternalSystemAdapterImpl(
         })
         .addNetworkInterceptor { chain ->
             val attempt = requireNotNull(chain.request().tag(PaymentAttempt::class.java))
+            if (attempt.acquired) throw ProtocolException("Repeated payment exchange is not allowed")
             val waitStarted = System.nanoTime()
             val permitted = try {
                 limiter.acquire(attempt.paymentId)
