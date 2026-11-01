@@ -3,14 +3,18 @@ package ru.quipy.payments.logic
 import com.fasterxml.jackson.databind.ObjectMapper
 import com.fasterxml.jackson.module.kotlin.registerKotlinModule
 import io.micrometer.core.instrument.Counter
+import io.micrometer.core.instrument.Gauge
 import io.micrometer.core.instrument.MeterRegistry
 import io.micrometer.core.instrument.Timer
+import okhttp3.Call
+import okhttp3.EventListener
 import okhttp3.OkHttpClient
 import okhttp3.Request
 import okhttp3.RequestBody
 import org.slf4j.LoggerFactory
 import ru.quipy.core.EventSourcingService
 import ru.quipy.payments.api.PaymentAggregate
+import java.io.IOException
 import java.net.SocketTimeoutException
 import java.time.Duration
 import java.util.*
@@ -59,7 +63,52 @@ class PaymentExternalSystemAdapterImpl(
     private val totalFailedTimer = totalDurationTimer(meterRegistry, "failed")
     private val totalDeadlineMissedTimer = totalDurationTimer(meterRegistry, "deadline_missed")
 
-    private val client = OkHttpClient.Builder().build()
+    private class PaymentAttempt(val paymentId: UUID) {
+        var acquired = false
+        var permittedAtNanos = 0L
+    }
+
+    private class AdmissionExpiredException : IOException("Payment deadline exceeded before submission.")
+
+    private val sentCounter = Counter.builder("payment.http.sent")
+        .tags("service", serviceName, "account", accountName).register(meterRegistry)
+    private val sendDelayTimer = stageTimer(meterRegistry, "permit_to_headers", "sent")
+    private val waitingGauge = Gauge.builder("payment.rps.waiting", limiter) { it.waitingCount().toDouble() }
+        .tags("service", serviceName, "account", accountName).register(meterRegistry)
+
+    private val client = OkHttpClient.Builder()
+        .eventListener(object : EventListener() {
+            override fun requestHeadersEnd(call: Call, request: Request) {
+                val attempt = request.tag(PaymentAttempt::class.java) ?: return
+                sentCounter.increment()
+                sendDelayTimer.record(System.nanoTime() - attempt.permittedAtNanos, TimeUnit.NANOSECONDS)
+            }
+        })
+        .addNetworkInterceptor { chain ->
+            val attempt = requireNotNull(chain.request().tag(PaymentAttempt::class.java))
+            val waitStarted = System.nanoTime()
+            val permitted = try {
+                limiter.acquire(attempt.paymentId)
+            } catch (e: InterruptedException) {
+                Thread.currentThread().interrupt()
+                false
+            }
+            val waitNanos = System.nanoTime() - waitStarted
+            if (!permitted) {
+                limiterMissedWaitTimer.record(waitNanos, TimeUnit.NANOSECONDS)
+                throw AdmissionExpiredException()
+            }
+            attempt.acquired = true
+            attempt.permittedAtNanos = System.nanoTime()
+            val externalStarted = System.nanoTime()
+            try {
+                chain.proceed(chain.request())
+            } finally {
+                externalCallTimer.record(System.nanoTime() - externalStarted, TimeUnit.NANOSECONDS)
+                limiterAdmittedWaitTimer.record(waitNanos, TimeUnit.NANOSECONDS)
+            }
+        }
+        .build()
 
     override fun tryReserve(paymentId: UUID, deadline: Long, executorParallelism: Int, amount: Int, receivedAt: Long): Boolean {
         val externalBudget = processingBudget()
@@ -78,7 +127,7 @@ class PaymentExternalSystemAdapterImpl(
 
         val transactionId = UUID.randomUUID()
 
-        var acquired = false
+        val attempt = PaymentAttempt(paymentId)
         var totalDurationRecorded = false
 
         fun recordTotalDuration(timer: Timer) {
@@ -94,44 +143,15 @@ class PaymentExternalSystemAdapterImpl(
                 it.logSubmission(true, transactionId, submittedAt, Duration.ofMillis(submittedAt - paymentStartedAt))
             }
 
-            val limiterStartedAt = now()
-            acquired = try {
-                limiter.acquire(paymentId)
-            } catch (e: InterruptedException) {
-                Thread.currentThread().interrupt()
-                false
-            }
-            val limiterWait = Duration.ofMillis(now() - limiterStartedAt)
-
-            if (!acquired) {
-                limiterMissedWaitTimer.record(limiterWait)
-                deadlineMissedCounter.increment()
-                val rejectedAt = now()
-                paymentESService.update(paymentId) {
-                    it.logSubmission(false, transactionId, rejectedAt, Duration.ofMillis(rejectedAt - paymentStartedAt))
-                }
-                paymentESService.update(paymentId) {
-                    it.logProcessing(false, now(), transactionId, reason = "Payment deadline exceeded before submission.")
-                }
-                recordTotalDuration(totalDeadlineMissedTimer)
-                return
-            }
-
-            limiterAdmittedWaitTimer.record(limiterWait)
-
             logger.info("[$accountName] Submit: $paymentId , txId: $transactionId")
 
             val request = Request.Builder().run {
                 url("http://$paymentProviderHostPort/external/process?serviceName=$serviceName&token=$token&accountName=$accountName&transactionId=$transactionId&paymentId=$paymentId&amount=$amount")
                 post(emptyBody)
+                tag(PaymentAttempt::class.java, attempt)
             }.build()
 
-            val externalStartedAt = now()
-            val response = try {
-                client.newCall(request).execute()
-            } finally {
-                externalCallTimer.record(Duration.ofMillis(now() - externalStartedAt))
-            }
+            val response = client.newCall(request).execute()
             response.use {
                 val body = try {
                     mapper.readValue(it.body?.string(), ExternalSysResponse::class.java)
@@ -149,6 +169,16 @@ class PaymentExternalSystemAdapterImpl(
                 }
                 recordTotalDuration(if (body.result) totalSuccessTimer else totalFailedTimer)
             }
+        } catch (e: AdmissionExpiredException) {
+            deadlineMissedCounter.increment()
+            val rejectedAt = now()
+            paymentESService.update(paymentId) {
+                it.logSubmission(false, transactionId, rejectedAt, Duration.ofMillis(rejectedAt - paymentStartedAt))
+            }
+            paymentESService.update(paymentId) {
+                it.logProcessing(false, now(), transactionId, reason = e.message)
+            }
+            recordTotalDuration(totalDeadlineMissedTimer)
         } catch (e: Exception) {
             recordTotalDuration(totalFailedTimer)
             when (e) {
@@ -168,7 +198,7 @@ class PaymentExternalSystemAdapterImpl(
                 }
             }
         } finally {
-            if (acquired) limiter.release()
+            if (attempt.acquired) limiter.release()
         }
     }
 
