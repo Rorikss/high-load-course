@@ -40,11 +40,14 @@ class PaymentAccountsConfig {
     @Value("\${payment.admission.p99-window:5m}")
     lateinit var admissionP99Window: Duration
 
-    @Value("\${payment.rps-window-margin:4ms}")
+    @Value("\${payment.rps-window-margin:0ms}")
     lateinit var rpsWindowMargin: Duration
 
     @Value("\${payment.priority-arrival-window:0ms}")
     lateinit var priorityArrivalWindow: Duration
+
+    @Value("\${payment.rps-burst-capacity:6}")
+    var burstCapacity: Int = 6
 
     @Bean
     fun accountAdapters(
@@ -76,6 +79,7 @@ class PaymentAccountsConfig {
                     admissionP99Window,
                     rpsWindowMargin,
                     priorityArrivalWindow,
+                    burstCapacity,
                 )
             }
     }

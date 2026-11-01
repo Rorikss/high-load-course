@@ -1,7 +1,7 @@
 package ru.quipy.payments.logic
 
 import ru.quipy.common.utils.OngoingWindow
-import ru.quipy.common.utils.SlidingWindowRateLimiter
+import ru.quipy.common.utils.BurstSlidingWindowRateLimiter
 import java.time.Duration
 import java.util.UUID
 import java.util.concurrent.atomic.AtomicInteger
@@ -11,6 +11,7 @@ class PaymentAccountLimiter(
     private val rateLimitPerSec: Int,
     rpsWindowMargin: Duration = Duration.ZERO,
     private val priorityArrivalWindow: Duration = Duration.ZERO,
+    burstCapacity: Int = 6,
 ) {
     init {
         require(!rpsWindowMargin.isNegative)
@@ -18,7 +19,7 @@ class PaymentAccountLimiter(
     }
 
     private val ongoingWindow = OngoingWindow(parallelRequests)
-    private val rateLimiter = SlidingWindowRateLimiter(rateLimitPerSec.toLong(), Duration.ofSeconds(1).plus(rpsWindowMargin))
+    private val rateLimiter = BurstSlidingWindowRateLimiter(rateLimitPerSec.toLong(), Duration.ofSeconds(1).plus(rpsWindowMargin), minOf(burstCapacity, rateLimitPerSec))
     private val pendingRequests = AtomicInteger()
     private data class Reservation(val latestStart: Long, val amount: Int, val receivedAt: Long)
 

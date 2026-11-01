@@ -28,6 +28,7 @@ class PaymentExternalSystemAdapterImpl(
     private val admissionP99Window: Duration,
     private val rpsWindowMargin: Duration = Duration.ZERO,
     priorityArrivalWindow: Duration = Duration.ZERO,
+    burstCapacity: Int = 6,
 ) : PaymentExternalSystemAdapter {
 
     companion object {
@@ -42,7 +43,7 @@ class PaymentExternalSystemAdapterImpl(
     private val requestAverageProcessingTime = properties.averageProcessingTime
     private val rateLimitPerSec = properties.rateLimitPerSec
     private val parallelRequests = properties.parallelRequests
-    private val limiter = PaymentAccountLimiter(parallelRequests, rateLimitPerSec, rpsWindowMargin, priorityArrivalWindow)
+    private val limiter = PaymentAccountLimiter(parallelRequests, rateLimitPerSec, rpsWindowMargin, priorityArrivalWindow, burstCapacity)
     private val startedAt = now()
     private val admittedCounter = admissionCounter(meterRegistry, "admitted")
     private val deadlineRejectedCounter = admissionCounter(meterRegistry, "deadline_rejected")
