@@ -32,16 +32,16 @@ class APIController {
     private val paymentRateLimiter: CompositeRateLimiter by lazy {
         CompositeRateLimiter(
             TokenBucketRateLimiter(
-                rate = 11,
-                bucketMaxCapacity = 80,
-                startBucket = 80,
+                rate = 20,
+                bucketMaxCapacity = 100,
+                startBucket = 100,
                 window = 1000,
                 timeUnit = TimeUnit.MILLISECONDS,
             ),
             LeakingBucketRateLimiter(
-                rate = 11,
+                rate = 20,
                 window = Duration.ofSeconds(1),
-                bucketSize = 11,
+                bucketSize = 20,
             ),
         )
     }
