@@ -32,16 +32,16 @@ class APIController {
     private val paymentRateLimiter: CompositeRateLimiter by lazy {
         CompositeRateLimiter(
             TokenBucketRateLimiter(
-                rate = 20,
-                bucketMaxCapacity = 100,
-                startBucket = 100,
+                rate = 100,
+                bucketMaxCapacity = 300,
+                startBucket = 300,
                 window = 1000,
                 timeUnit = TimeUnit.MILLISECONDS,
             ),
             LeakingBucketRateLimiter(
-                rate = 20,
+                rate = 100,
                 window = Duration.ofSeconds(1),
-                bucketSize = 20,
+                bucketSize = 300,
             ),
         )
     }
@@ -85,7 +85,7 @@ class APIController {
     fun payOrder(@PathVariable orderId: UUID, @RequestParam deadline: Long): ResponseEntity<Any> {
         val receivedAt = System.currentTimeMillis()
         if (!paymentRateLimiter.tick()) {
-            throw TooManyRequestsException(retryAfterMillisecond = 250)
+            throw TooManyRequestsException(retryAfterMillisecond = 30)
         }
         val paymentId = UUID.randomUUID()
         val order = orderRepository.findById(orderId) ?: throw IllegalArgumentException("No such order $orderId")
