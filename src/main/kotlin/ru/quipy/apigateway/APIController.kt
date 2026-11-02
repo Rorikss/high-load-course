@@ -23,6 +23,22 @@ class APIController {
     @Autowired
     private lateinit var orderPayer: OrderPayer
 
+//    private val paymentRateLimiter: CompositeRateLimiter =
+//        CompositeRateLimiter(
+//            TokenBucketRateLimiter(
+//                rate = 3,
+//                bucketMaxCapacity = 80,
+//                startBucket = 80,
+//                window = 1000,
+//                timeUnit = TimeUnit.MILLISECONDS,
+//            ),
+//            LeakingBucketRateLimiter(
+//                rate = 3,
+//                window = Duration.ofSeconds(1),
+//                bucketSize = 3,
+//            ),
+//        )
+
     @PostMapping("/users")
     fun createUser(@RequestBody req: CreateUserRequest): User {
         return User(UUID.randomUUID(), req.name)
