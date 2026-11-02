@@ -7,10 +7,16 @@ import org.springframework.http.HttpHeaders
 import org.springframework.http.HttpStatus
 import org.springframework.http.ResponseEntity
 import org.springframework.web.bind.annotation.*
+import ru.quipy.common.utils.CompositeRateLimiter
+import ru.quipy.common.utils.LeakingBucketRateLimiter
+import ru.quipy.common.utils.TokenBucketRateLimiter
+import ru.quipy.exceptions.TooManyRequestsException
 import ru.quipy.orders.repository.OrderRepository
 import ru.quipy.payments.logic.OrderPayer
+import java.time.Duration
 import java.util.*
 import java.util.concurrent.RejectedExecutionException
+import java.util.concurrent.TimeUnit
 
 @RestController
 class APIController {
@@ -23,21 +29,22 @@ class APIController {
     @Autowired
     private lateinit var orderPayer: OrderPayer
 
-//    private val paymentRateLimiter: CompositeRateLimiter =
-//        CompositeRateLimiter(
-//            TokenBucketRateLimiter(
-//                rate = 3,
-//                bucketMaxCapacity = 80,
-//                startBucket = 80,
-//                window = 1000,
-//                timeUnit = TimeUnit.MILLISECONDS,
-//            ),
-//            LeakingBucketRateLimiter(
-//                rate = 3,
-//                window = Duration.ofSeconds(1),
-//                bucketSize = 3,
-//            ),
-//        )
+    private val paymentRateLimiter: CompositeRateLimiter by lazy {
+        CompositeRateLimiter(
+            TokenBucketRateLimiter(
+                rate = 11,
+                bucketMaxCapacity = 80,
+                startBucket = 80,
+                window = 1000,
+                timeUnit = TimeUnit.MILLISECONDS,
+            ),
+            LeakingBucketRateLimiter(
+                rate = 11,
+                window = Duration.ofSeconds(1),
+                bucketSize = 11,
+            ),
+        )
+    }
 
     @PostMapping("/users")
     fun createUser(@RequestBody req: CreateUserRequest): User {
@@ -77,6 +84,9 @@ class APIController {
     @PostMapping("/orders/{orderId}/payment")
     fun payOrder(@PathVariable orderId: UUID, @RequestParam deadline: Long): ResponseEntity<Any> {
         val receivedAt = System.currentTimeMillis()
+        if (!paymentRateLimiter.tick()) {
+            throw TooManyRequestsException(retryAfterMillisecond = 250)
+        }
         val paymentId = UUID.randomUUID()
         val order = orderRepository.findById(orderId) ?: throw IllegalArgumentException("No such order $orderId")
         val createdAt = try {

@@ -8,12 +8,8 @@ import org.slf4j.LoggerFactory
 import org.springframework.beans.factory.annotation.Autowired
 import org.springframework.beans.factory.annotation.Value
 import org.springframework.stereotype.Service
-import ru.quipy.common.utils.CompositeRateLimiter
 import ru.quipy.common.utils.NamedThreadFactory
-import ru.quipy.common.utils.SlidingWindowRateLimiter
-import ru.quipy.common.utils.TokenBucketRateLimiter
 import ru.quipy.core.EventSourcingService
-import ru.quipy.exceptions.TooManyRequestsException
 import ru.quipy.payments.api.PaymentAggregate
 import java.time.Duration
 import java.util.*
@@ -56,22 +52,6 @@ class OrderPayer(
         ThreadPoolExecutor.AbortPolicy()
     )
 
-    private val outgoingRateLimiter: CompositeRateLimiter by lazy {
-        CompositeRateLimiter(
-            SlidingWindowRateLimiter(
-                rate = 11,
-                window = Duration.ofSeconds(1),
-            ),
-            TokenBucketRateLimiter(
-                rate = 11,
-                bucketMaxCapacity = 6,
-                startBucket = 6,
-                window = 1000,
-                timeUnit = TimeUnit.MILLISECONDS,
-            )
-        )
-    }
-
     init {
         Gauge.builder("payment.executor.queue.size", paymentExecutor) { it.queue.size.toDouble() }
             .description("Number of payment tasks waiting in the executor queue")
@@ -95,10 +75,6 @@ class OrderPayer(
         val paymentAccount = paymentAccounts.single()
         if (!paymentAccount.tryReserve(deadline, paymentExecutor.maximumPoolSize)) {
             throw RejectedExecutionException("Payment cannot be completed before deadline")
-        }
-        if (!outgoingRateLimiter.tick()) {
-            paymentAccount.releaseReservation()
-            throw TooManyRequestsException(retryAfterMillisecond = 250)
         }
 
         try {
