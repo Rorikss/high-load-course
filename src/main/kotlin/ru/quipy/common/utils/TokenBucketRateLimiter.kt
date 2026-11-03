@@ -51,4 +51,6 @@ class TokenBucketRateLimiter(
             }
         }
     }
+
+    fun availableTokens(): Int = bucket.get()
 }

@@ -1,5 +1,6 @@
 package ru.quipy.payments.logic
 
+import ru.quipy.common.utils.LeakingBucketRateLimiter
 import ru.quipy.common.utils.OngoingWindow
 import ru.quipy.common.utils.SlidingWindowRateLimiter
 import java.time.Duration
@@ -14,6 +15,12 @@ class PaymentAccountLimiter(
     private val ongoingWindow = OngoingWindow(parallelRequests)
     private val rateLimiter = SlidingWindowRateLimiter(rateLimitPerSec.toLong(), Duration.ofSeconds(1))
     private val pendingRequests = AtomicInteger()
+
+    private companion object {
+        // Extra margin added to the admission estimate to avoid accepting payments
+        // that would not get a rate-limiter slot before the deadline.
+        const val SAFETY_RESERVE_MILLIS = 250L
+    }
 
     fun tryReserve(deadline: Long, processingBudget: Duration, executorParallelism: Int): Boolean {
         val effectiveParallelism = minOf(parallelRequests, executorParallelism)
