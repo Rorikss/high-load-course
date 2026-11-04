@@ -21,7 +21,7 @@ class GlobalExceptionHandler {
         logger.info("Too many requests, retry after {} ms", ex.retryAfterMillisecond)
         return ResponseEntity
             .status(HttpStatus.TOO_MANY_REQUESTS)
-            .header(HttpHeaders.RETRY_AFTER, ex.retryAfterMillisecond.toString())
+            .header(HttpHeaders.RETRY_AFTER, (System.currentTimeMillis() + ex.retryAfterMillisecond).toString())
             .build()
     }
 }

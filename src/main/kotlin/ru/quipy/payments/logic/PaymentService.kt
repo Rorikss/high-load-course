@@ -41,7 +41,6 @@ data class PaymentAccountProperties(
     val price: Int,
     val averageProcessingTime: Duration = Duration.ofSeconds(11),
     val enabled: Boolean,
-    val maxBurst: Int = rateLimitPerSec * 30,
 )
 
 /**

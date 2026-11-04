@@ -1,10 +1,11 @@
 package ru.quipy.payments.logic
 
-import ru.quipy.common.utils.LeakingBucketRateLimiter
 import ru.quipy.common.utils.OngoingWindow
 import ru.quipy.common.utils.SlidingWindowRateLimiter
 import java.time.Duration
+import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicInteger
+import java.util.concurrent.locks.ReentrantLock
 import kotlin.math.ceil
 
 class PaymentAccountLimiter(
@@ -13,14 +14,11 @@ class PaymentAccountLimiter(
     private val averageProcessingTime: Duration,
 ) {
     private val ongoingWindow = OngoingWindow(parallelRequests)
-    private val rateLimiter = SlidingWindowRateLimiter(rateLimitPerSec.toLong(), Duration.ofSeconds(1))
+    private val rateWindow = Duration.ofSeconds(1)
+    private val rateLimiter = SlidingWindowRateLimiter(rateLimitPerSec.toLong(), rateWindow,)
     private val pendingRequests = AtomicInteger()
+    private val dispatchLock = ReentrantLock(true)
 
-    private companion object {
-        // Extra margin added to the admission estimate to avoid accepting payments
-        // that would not get a rate-limiter slot before the deadline.
-        const val SAFETY_RESERVE_MILLIS = 250L
-    }
 
     fun tryReserve(deadline: Long, processingBudget: Duration, executorParallelism: Int): Boolean {
         val effectiveParallelism = minOf(parallelRequests, executorParallelism)
@@ -28,7 +26,8 @@ class PaymentAccountLimiter(
         val throughputPerMillis = minOf(rateLimitPerSec / 1_000.0, effectiveParallelism / processingMillis)
         while (true) {
             val pending = pendingRequests.get()
-            val waitingMillis = maxOf(0.0, (pending + 1) / throughputPerMillis - processingMillis)
+            val rateWaitMillis = (pending / rateLimitPerSec) * rateWindow.toMillis()
+            val waitingMillis = maxOf(rateWaitMillis.toDouble(), (pending + 1) / throughputPerMillis - processingMillis)
             val waitingSafetyMarginMillis = if (pending >= effectiveParallelism) 1.0 / throughputPerMillis else 0.0
             val estimatedFinish = System.currentTimeMillis() +
                 ceil(waitingMillis + waitingSafetyMarginMillis).toLong() +
@@ -51,9 +50,17 @@ class PaymentAccountLimiter(
 
         var acquired = false
         try {
-            if (!rateLimiter.tickBlocking(latestStart)) return false
-            acquired = System.currentTimeMillis() < latestStart
-            return acquired
+            val lockWaitMillis = latestStart - System.currentTimeMillis()
+            if (lockWaitMillis <= 0 || !dispatchLock.tryLock(lockWaitMillis, TimeUnit.MILLISECONDS)) {
+                return false
+            }
+            try {
+                if (!rateLimiter.tickBlocking(latestStart)) return false
+                acquired = System.currentTimeMillis() < latestStart
+                return acquired
+            } finally {
+                dispatchLock.unlock()
+            }
         } finally {
             if (!acquired) ongoingWindow.release()
         }
