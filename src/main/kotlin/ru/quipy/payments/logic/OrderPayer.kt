@@ -38,13 +38,9 @@ class OrderPayer(
     @Autowired
     private lateinit var paymentAccounts: List<PaymentExternalSystemAdapter>
 
-    init {
-        require(queueCapacity > 0) { "payment.queue-capacity must be positive" }
-    }
-
     private val paymentExecutor = ThreadPoolExecutor(
-        16,
-        16,
+        32,
+        32,
         0L,
         TimeUnit.MILLISECONDS,
         LinkedBlockingQueue(queueCapacity),
