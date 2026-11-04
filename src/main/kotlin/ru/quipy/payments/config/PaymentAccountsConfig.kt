@@ -41,10 +41,7 @@ class PaymentAccountsConfig {
     lateinit var admissionP99Window: Duration
 
     @Bean
-    fun accountAdapters(
-        paymentService: EventSourcingService<UUID, PaymentAggregate, PaymentAggregateState>,
-        meterRegistry: MeterRegistry,
-    ): List<PaymentExternalSystemAdapter> {
+    fun accounts(): List<PaymentAccountProperties> {
         val request = HttpRequest.newBuilder()
             .uri(URI("http://${paymentProviderHostPort}/external/accounts?serviceName=$serviceName&token=$token"))
             .GET()
@@ -60,15 +57,28 @@ class PaymentAccountsConfig {
             .filter { it.accountName in allowedAccounts }
             .map { it.copy(enabled = true) }
             .onEach(::println)
-            .map {
-                PaymentExternalSystemAdapterImpl(
-                    it,
-                    paymentService,
-                    paymentProviderHostPort,
-                    token,
-                    meterRegistry,
-                    admissionP99Window,
-                )
-            }
+    }
+
+    @Bean
+    fun accountProperties(accounts: List<PaymentAccountProperties>): PaymentAccountProperties {
+        return accounts.single()
+    }
+
+    @Bean
+    fun accountAdapters(
+        accounts: List<PaymentAccountProperties>,
+        paymentService: EventSourcingService<UUID, PaymentAggregate, PaymentAggregateState>,
+        meterRegistry: MeterRegistry,
+    ): List<PaymentExternalSystemAdapter> {
+        return accounts.map {
+            PaymentExternalSystemAdapterImpl(
+                it,
+                paymentService,
+                paymentProviderHostPort,
+                token,
+                meterRegistry,
+                admissionP99Window,
+            )
+        }
     }
 }
