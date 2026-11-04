@@ -2,6 +2,8 @@ package ru.quipy.payments.logic
 
 import com.fasterxml.jackson.databind.ObjectMapper
 import com.fasterxml.jackson.module.kotlin.registerKotlinModule
+import io.github.resilience4j.retry.Retry
+import io.github.resilience4j.retry.RetryConfig
 import io.micrometer.core.instrument.Counter
 import io.micrometer.core.instrument.MeterRegistry
 import io.micrometer.core.instrument.Timer
@@ -26,7 +28,12 @@ class PaymentExternalSystemAdapterImpl(
     private val token: String,
     meterRegistry: MeterRegistry,
     private val admissionP99Window: Duration,
+    private val maxRetries: Int,
 ) : PaymentExternalSystemAdapter {
+
+    init {
+        require(maxRetries >= 0) { "payment.max-retries must be non-negative" }
+    }
 
     companion object {
         val logger = LoggerFactory.getLogger(PaymentExternalSystemAdapter::class.java)
@@ -74,7 +81,6 @@ class PaymentExternalSystemAdapterImpl(
 
         val transactionId = UUID.randomUUID()
 
-        var acquired = false
         var totalDurationRecorded = false
 
         fun recordTotalDuration(timer: Timer) {
@@ -90,9 +96,19 @@ class PaymentExternalSystemAdapterImpl(
                 it.logSubmission(true, transactionId, submittedAt, Duration.ofMillis(submittedAt - paymentStartedAt))
             }
 
-            for (attempt in 0..2) {
+            val retry = Retry.of("payment-$accountName", RetryConfig.custom<ExternalSysResponse?>()
+                .maxAttempts(Math.addExact(maxRetries, 1))
+                .waitDuration(Duration.ZERO)
+                .retryOnException { false }
+                .retryOnResult { response ->
+                    response != null && !response.result && response.message == "Temporary error" &&
+                        now() + processingBudget().toMillis() < deadline
+                }
+                .build())
+
+            val body = retry.executeSupplier<ExternalSysResponse?> {
                 val limiterStartedAt = now()
-                acquired = try {
+                val acquired = try {
                     limiter.acquire(deadline, processingBudget())
                 } catch (e: InterruptedException) {
                     Thread.currentThread().interrupt()
@@ -111,51 +127,47 @@ class PaymentExternalSystemAdapterImpl(
                         it.logProcessing(false, now(), transactionId, reason = "Payment deadline exceeded before submission.")
                     }
                     recordTotalDuration(totalDeadlineMissedTimer)
-                    return
+                    return@executeSupplier null
                 }
 
-                limiterAdmittedWaitTimer.record(limiterWait)
+                try {
+                    limiterAdmittedWaitTimer.record(limiterWait)
 
-                logger.info("[$accountName] Submit: $paymentId , txId: $transactionId")
+                    logger.info("[$accountName] Submit: $paymentId , txId: $transactionId")
 
-                val request = Request.Builder().run {
-                    url("http://$paymentProviderHostPort/external/process?serviceName=$serviceName&token=$token&accountName=$accountName&transactionId=$transactionId&paymentId=$paymentId&amount=$amount")
-                    post(emptyBody)
-                }.build()
+                    val request = Request.Builder().run {
+                        url("http://$paymentProviderHostPort/external/process?serviceName=$serviceName&token=$token&accountName=$accountName&transactionId=$transactionId&paymentId=$paymentId&amount=$amount")
+                        post(emptyBody)
+                    }.build()
 
-                val externalStartedAt = now()
-                val response = try {
-                    client.newCall(request).execute()
-                } finally {
-                    externalCallTimer.record(Duration.ofMillis(now() - externalStartedAt))
-                }
-                val body = response.use {
-                    try {
-                        mapper.readValue(it.body?.string(), ExternalSysResponse::class.java)
-                    } catch (e: Exception) {
-                        logger.error("[$accountName] [ERROR] Payment processed for txId: $transactionId, payment: $paymentId, result code: ${it.code}, reason: ${it.body?.string()}")
-                        ExternalSysResponse(transactionId.toString(), paymentId.toString(),false, e.message)
+                    val externalStartedAt = now()
+                    val response = try {
+                        client.newCall(request).execute()
+                    } finally {
+                        externalCallTimer.record(Duration.ofMillis(now() - externalStartedAt))
+                    }
+                    val body = response.use {
+                        try {
+                            mapper.readValue(it.body?.string(), ExternalSysResponse::class.java)
+                        } catch (e: Exception) {
+                            logger.error("[$accountName] [ERROR] Payment processed for txId: $transactionId, payment: $paymentId, result code: ${it.code}, reason: ${it.body?.string()}")
+                            ExternalSysResponse(transactionId.toString(), paymentId.toString(),false, e.message)
+                        }
+
                     }
 
-                }
-
-                logger.warn("[$accountName] Payment processed for txId: $transactionId, payment: $paymentId, succeeded: ${body.result}, message: ${body.message}")
-
-                if (!body.result && body.message == "Temporary error" && attempt < 2 &&
-                    now() + processingBudget().toMillis() < deadline) {
+                    logger.warn("[$accountName] Payment processed for txId: $transactionId, payment: $paymentId, succeeded: ${body.result}, message: ${body.message}")
+                    body
+                } finally {
                     limiter.release()
-                    acquired = false
-                    continue
                 }
-
-                // Здесь мы обновляем состояние оплаты в зависимости от результата в базе данных оплат.
-                // Это требуется сделать ВО ВСЕХ ИСХОДАХ (успешная оплата / неуспешная / ошибочная ситуация)
-                paymentESService.update(paymentId) {
-                    it.logProcessing(body.result, now(), transactionId, reason = body.message)
-                }
-                recordTotalDuration(if (body.result) totalSuccessTimer else totalFailedTimer)
-                return
+            } ?: return
+            // Здесь мы обновляем состояние оплаты в зависимости от результата в базе данных оплат.
+            // Это требуется сделать ВО ВСЕХ ИСХОДАХ (успешная оплата / неуспешная / ошибочная ситуация)
+            paymentESService.update(paymentId) {
+                it.logProcessing(body.result, now(), transactionId, reason = body.message)
             }
+            recordTotalDuration(if (body.result) totalSuccessTimer else totalFailedTimer)
         } catch (e: Exception) {
             recordTotalDuration(totalFailedTimer)
             when (e) {
@@ -174,8 +186,6 @@ class PaymentExternalSystemAdapterImpl(
                     }
                 }
             }
-        } finally {
-            if (acquired) limiter.release()
         }
     }
 

@@ -40,6 +40,9 @@ class PaymentAccountsConfig {
     @Value("\${payment.admission.p99-window:5m}")
     lateinit var admissionP99Window: Duration
 
+    @Value("\${payment.max-retries}")
+    var maxRetries: Int = 2
+
     @Bean
     fun accounts(): List<PaymentAccountProperties> {
         val request = HttpRequest.newBuilder()
@@ -78,6 +81,7 @@ class PaymentAccountsConfig {
                 token,
                 meterRegistry,
                 admissionP99Window,
+                maxRetries,
             )
         }
     }
