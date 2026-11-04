@@ -90,53 +90,63 @@ class PaymentExternalSystemAdapterImpl(
                 it.logSubmission(true, transactionId, submittedAt, Duration.ofMillis(submittedAt - paymentStartedAt))
             }
 
-            val limiterStartedAt = now()
-            acquired = try {
-                limiter.acquire(deadline, processingBudget())
-            } catch (e: InterruptedException) {
-                Thread.currentThread().interrupt()
-                false
-            }
-            val limiterWait = Duration.ofMillis(now() - limiterStartedAt)
-
-            if (!acquired) {
-                limiterMissedWaitTimer.record(limiterWait)
-                deadlineMissedCounter.increment()
-                val rejectedAt = now()
-                paymentESService.update(paymentId) {
-                    it.logSubmission(false, transactionId, rejectedAt, Duration.ofMillis(rejectedAt - paymentStartedAt))
+            for (attempt in 0..2) {
+                val limiterStartedAt = now()
+                acquired = try {
+                    limiter.acquire(deadline, processingBudget())
+                } catch (e: InterruptedException) {
+                    Thread.currentThread().interrupt()
+                    false
                 }
-                paymentESService.update(paymentId) {
-                    it.logProcessing(false, now(), transactionId, reason = "Payment deadline exceeded before submission.")
+                val limiterWait = Duration.ofMillis(now() - limiterStartedAt)
+
+                if (!acquired) {
+                    limiterMissedWaitTimer.record(limiterWait)
+                    deadlineMissedCounter.increment()
+                    val rejectedAt = now()
+                    paymentESService.update(paymentId) {
+                        it.logSubmission(false, transactionId, rejectedAt, Duration.ofMillis(rejectedAt - paymentStartedAt))
+                    }
+                    paymentESService.update(paymentId) {
+                        it.logProcessing(false, now(), transactionId, reason = "Payment deadline exceeded before submission.")
+                    }
+                    recordTotalDuration(totalDeadlineMissedTimer)
+                    return
                 }
-                recordTotalDuration(totalDeadlineMissedTimer)
-                return
-            }
 
-            limiterAdmittedWaitTimer.record(limiterWait)
+                limiterAdmittedWaitTimer.record(limiterWait)
 
-            logger.info("[$accountName] Submit: $paymentId , txId: $transactionId")
+                logger.info("[$accountName] Submit: $paymentId , txId: $transactionId")
 
-            val request = Request.Builder().run {
-                url("http://$paymentProviderHostPort/external/process?serviceName=$serviceName&token=$token&accountName=$accountName&transactionId=$transactionId&paymentId=$paymentId&amount=$amount")
-                post(emptyBody)
-            }.build()
+                val request = Request.Builder().run {
+                    url("http://$paymentProviderHostPort/external/process?serviceName=$serviceName&token=$token&accountName=$accountName&transactionId=$transactionId&paymentId=$paymentId&amount=$amount")
+                    post(emptyBody)
+                }.build()
 
-            val externalStartedAt = now()
-            val response = try {
-                client.newCall(request).execute()
-            } finally {
-                externalCallTimer.record(Duration.ofMillis(now() - externalStartedAt))
-            }
-            response.use {
-                val body = try {
-                    mapper.readValue(it.body?.string(), ExternalSysResponse::class.java)
-                } catch (e: Exception) {
-                    logger.error("[$accountName] [ERROR] Payment processed for txId: $transactionId, payment: $paymentId, result code: ${it.code}, reason: ${it.body?.string()}")
-                    ExternalSysResponse(transactionId.toString(), paymentId.toString(),false, e.message)
+                val externalStartedAt = now()
+                val response = try {
+                    client.newCall(request).execute()
+                } finally {
+                    externalCallTimer.record(Duration.ofMillis(now() - externalStartedAt))
+                }
+                val body = response.use {
+                    try {
+                        mapper.readValue(it.body?.string(), ExternalSysResponse::class.java)
+                    } catch (e: Exception) {
+                        logger.error("[$accountName] [ERROR] Payment processed for txId: $transactionId, payment: $paymentId, result code: ${it.code}, reason: ${it.body?.string()}")
+                        ExternalSysResponse(transactionId.toString(), paymentId.toString(),false, e.message)
+                    }
+
                 }
 
                 logger.warn("[$accountName] Payment processed for txId: $transactionId, payment: $paymentId, succeeded: ${body.result}, message: ${body.message}")
+
+                if (!body.result && body.message == "Temporary error" && attempt < 2 &&
+                    now() + processingBudget().toMillis() < deadline) {
+                    limiter.release()
+                    acquired = false
+                    continue
+                }
 
                 // Здесь мы обновляем состояние оплаты в зависимости от результата в базе данных оплат.
                 // Это требуется сделать ВО ВСЕХ ИСХОДАХ (успешная оплата / неуспешная / ошибочная ситуация)
@@ -144,6 +154,7 @@ class PaymentExternalSystemAdapterImpl(
                     it.logProcessing(body.result, now(), transactionId, reason = body.message)
                 }
                 recordTotalDuration(if (body.result) totalSuccessTimer else totalFailedTimer)
+                return
             }
         } catch (e: Exception) {
             recordTotalDuration(totalFailedTimer)
