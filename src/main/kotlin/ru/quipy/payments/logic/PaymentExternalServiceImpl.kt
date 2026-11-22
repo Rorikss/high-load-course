@@ -78,6 +78,7 @@ class PaymentExternalSystemAdapterImpl(
 
     private val client = OkHttpClient.Builder()
         .callTimeout(attemptTimeout)
+        .retryOnConnectionFailure(false)
         .build()
 
     init {
@@ -158,8 +159,9 @@ class PaymentExternalSystemAdapterImpl(
 
                     logger.info("[$accountName] Submit: $paymentId , txId: $transactionId")
 
+                    val timeoutMillis = minOf(attemptBudget.toMillis(), deadline - now())
                     val request = Request.Builder().run {
-                        url("http://$paymentProviderHostPort/external/process?serviceName=$serviceName&token=$token&accountName=$accountName&transactionId=$transactionId&paymentId=$paymentId&amount=$amount")
+                        url("http://$paymentProviderHostPort/external/process?serviceName=$serviceName&token=$token&accountName=$accountName&transactionId=$transactionId&paymentId=$paymentId&amount=$amount&timeout=${Duration.ofMillis(timeoutMillis)}")
                         post(emptyBody)
                     }.build()
 
@@ -168,9 +170,10 @@ class PaymentExternalSystemAdapterImpl(
                     val externalStartedAt = now()
                     try {
                         val call = client.newCall(request)
-                        call.timeout().timeout(minOf(attemptBudget.toMillis(), deadline - now()), TimeUnit.MILLISECONDS)
+                        call.timeout().timeout(timeoutMillis, TimeUnit.MILLISECONDS)
                         val response = call.execute()
                         val body = response.use {
+                            if (it.code == 408) throw SocketTimeoutException("Provider request timeout")
                             try {
                                 mapper.readValue(it.body?.string(), ExternalSysResponse::class.java)
                             } catch (e: Exception) {
