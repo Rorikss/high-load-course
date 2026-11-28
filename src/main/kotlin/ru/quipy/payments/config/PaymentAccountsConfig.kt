@@ -43,6 +43,9 @@ class PaymentAccountsConfig {
     @Value("\${payment.max-retries}")
     var maxRetries: Int = 2
 
+    @Value("\${payment.attempt-timeout:1500ms}")
+    lateinit var attemptTimeout: Duration
+
     @Bean
     fun accounts(): List<PaymentAccountProperties> {
         val request = HttpRequest.newBuilder()
@@ -82,6 +85,7 @@ class PaymentAccountsConfig {
                 meterRegistry,
                 admissionP99Window,
                 maxRetries,
+                attemptTimeout,
             )
         }
     }

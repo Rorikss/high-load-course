@@ -5,6 +5,7 @@ import com.fasterxml.jackson.module.kotlin.registerKotlinModule
 import io.github.resilience4j.retry.Retry
 import io.github.resilience4j.retry.RetryConfig
 import io.micrometer.core.instrument.Counter
+import io.micrometer.core.instrument.Gauge
 import io.micrometer.core.instrument.MeterRegistry
 import io.micrometer.core.instrument.Timer
 import okhttp3.OkHttpClient
@@ -13,6 +14,7 @@ import okhttp3.RequestBody
 import org.slf4j.LoggerFactory
 import ru.quipy.core.EventSourcingService
 import ru.quipy.payments.api.PaymentAggregate
+import java.io.InterruptedIOException
 import java.net.SocketTimeoutException
 import java.time.Duration
 import java.util.*
@@ -29,10 +31,12 @@ class PaymentExternalSystemAdapterImpl(
     meterRegistry: MeterRegistry,
     private val admissionP99Window: Duration,
     private val maxRetries: Int,
+    private val attemptTimeout: Duration,
 ) : PaymentExternalSystemAdapter {
 
     init {
         require(maxRetries >= 0) { "payment.max-retries must be non-negative" }
+        require(!attemptTimeout.isZero && !attemptTimeout.isNegative) { "payment.attempt-timeout must be positive" }
     }
 
     companion object {
@@ -52,6 +56,14 @@ class PaymentExternalSystemAdapterImpl(
     private val admittedCounter = admissionCounter(meterRegistry, "admitted")
     private val deadlineRejectedCounter = admissionCounter(meterRegistry, "deadline_rejected")
     private val deadlineMissedCounter = admissionCounter(meterRegistry, "deadline_missed")
+    private val retryCounter = Counter.builder("payment.retry.attempts")
+        .description("Number of external payment calls actually sent after the initial attempt")
+        .tags("service", serviceName, "account", accountName)
+        .register(meterRegistry)
+    private val timeoutCounter = Counter.builder("payment.attempt.outcomes")
+        .description("Number of timed out external payment attempts")
+        .tags("service", serviceName, "account", accountName, "outcome", "timeout")
+        .register(meterRegistry)
     private val limiterAdmittedWaitTimer = stageTimer(meterRegistry, "limiter_wait", "admitted")
     private val limiterMissedWaitTimer = stageTimer(meterRegistry, "limiter_wait", "deadline_missed")
     private val externalCallTimer = stageTimer(
@@ -64,7 +76,17 @@ class PaymentExternalSystemAdapterImpl(
     private val totalFailedTimer = totalDurationTimer(meterRegistry, "failed")
     private val totalDeadlineMissedTimer = totalDurationTimer(meterRegistry, "deadline_missed")
 
-    private val client = OkHttpClient.Builder().build()
+    private val client = OkHttpClient.Builder()
+        .callTimeout(attemptTimeout)
+        .retryOnConnectionFailure(false)
+        .build()
+
+    init {
+        Gauge.builder("payment.external.timeout.seconds", this) { it.calculateAttemptTimeout().toMillis() / 1000.0 }
+            .description("Adaptive timeout budget of one HTTP attempt before the deadline cap")
+            .tags("service", serviceName, "account", accountName)
+            .register(meterRegistry)
+    }
 
     override fun tryReserve(deadline: Long, executorParallelism: Int): Boolean {
         val reserved = limiter.tryReserve(deadline, processingBudget(), executorParallelism)
@@ -99,14 +121,16 @@ class PaymentExternalSystemAdapterImpl(
             val retry = Retry.of("payment-$accountName", RetryConfig.custom<ExternalSysResponse?>()
                 .maxAttempts(Math.addExact(maxRetries, 1))
                 .waitDuration(Duration.ZERO)
-                .retryOnException { false }
+                .retryOnException { it is InterruptedIOException && now() + processingBudget().toMillis() < deadline }
                 .retryOnResult { response ->
                     response != null && !response.result && response.message == "Temporary error" &&
                         now() + processingBudget().toMillis() < deadline
                 }
                 .build())
+            var attempt = 0
 
-            val body = retry.executeSupplier<ExternalSysResponse?> {
+            val body = retry.executeCallable<ExternalSysResponse?> {
+                val attemptBudget = calculateAttemptTimeout()
                 val limiterStartedAt = now()
                 val acquired = try {
                     limiter.acquire(deadline, processingBudget())
@@ -127,7 +151,7 @@ class PaymentExternalSystemAdapterImpl(
                         it.logProcessing(false, now(), transactionId, reason = "Payment deadline exceeded before submission.")
                     }
                     recordTotalDuration(totalDeadlineMissedTimer)
-                    return@executeSupplier null
+                    return@executeCallable null
                 }
 
                 try {
@@ -135,29 +159,37 @@ class PaymentExternalSystemAdapterImpl(
 
                     logger.info("[$accountName] Submit: $paymentId , txId: $transactionId")
 
+                    val timeoutMillis = minOf(attemptBudget.toMillis(), deadline - now())
                     val request = Request.Builder().run {
-                        url("http://$paymentProviderHostPort/external/process?serviceName=$serviceName&token=$token&accountName=$accountName&transactionId=$transactionId&paymentId=$paymentId&amount=$amount")
+                        url("http://$paymentProviderHostPort/external/process?serviceName=$serviceName&token=$token&accountName=$accountName&transactionId=$transactionId&paymentId=$paymentId&amount=$amount&timeout=${Duration.ofMillis(timeoutMillis)}")
                         post(emptyBody)
                     }.build()
 
+                    if (attempt++ > 0) retryCounter.increment()
+
                     val externalStartedAt = now()
-                    val response = try {
-                        client.newCall(request).execute()
+                    try {
+                        val call = client.newCall(request)
+                        call.timeout().timeout(timeoutMillis, TimeUnit.MILLISECONDS)
+                        val response = call.execute()
+                        val body = response.use {
+                            if (it.code == 408) throw SocketTimeoutException("Provider request timeout")
+                            try {
+                                mapper.readValue(it.body?.string(), ExternalSysResponse::class.java)
+                            } catch (e: Exception) {
+                                if (e is InterruptedIOException) throw e
+                                logger.error("[$accountName] [ERROR] Payment processed for txId: $transactionId, payment: $paymentId, result code: ${it.code}, reason: ${e.message}", e)
+                                ExternalSysResponse(transactionId.toString(), paymentId.toString(), false, e.message)
+                            }
+                        }
+                        logger.warn("[$accountName] Payment processed for txId: $transactionId, payment: $paymentId, succeeded: ${body.result}, message: ${body.message}")
+                        body
+                    } catch (e: InterruptedIOException) {
+                        timeoutCounter.increment()
+                        throw e
                     } finally {
                         externalCallTimer.record(Duration.ofMillis(now() - externalStartedAt))
                     }
-                    val body = response.use {
-                        try {
-                            mapper.readValue(it.body?.string(), ExternalSysResponse::class.java)
-                        } catch (e: Exception) {
-                            logger.error("[$accountName] [ERROR] Payment processed for txId: $transactionId, payment: $paymentId, result code: ${it.code}, reason: ${it.body?.string()}")
-                            ExternalSysResponse(transactionId.toString(), paymentId.toString(),false, e.message)
-                        }
-
-                    }
-
-                    logger.warn("[$accountName] Payment processed for txId: $transactionId, payment: $paymentId, succeeded: ${body.result}, message: ${body.message}")
-                    body
                 } finally {
                     limiter.release()
                 }
@@ -209,6 +241,22 @@ class PaymentExternalSystemAdapterImpl(
         return Duration.ofMillis(ceil(p99Millis).toLong())
     }
 
+    private fun calculateAttemptTimeout(): Duration {
+        if (externalCallTimer.count() < 100) return attemptTimeout
+
+        val p85Millis = externalCallTimer.takeSnapshot()
+            .percentileValues()
+            .firstOrNull { it.percentile() == 0.85 }
+            ?.value(TimeUnit.MILLISECONDS)
+            ?.takeIf { it.isFinite() && it > 0.0 }
+            ?: return attemptTimeout
+
+        val lowerBound = minOf(attemptTimeout, requestAverageProcessingTime)
+        val upperBound = maxOf(attemptTimeout, requestAverageProcessingTime.multipliedBy(2))
+        return Duration.ofMillis(ceil(p85Millis * 1.5).toLong())
+            .coerceIn(lowerBound, upperBound)
+    }
+
     private fun admissionCounter(meterRegistry: MeterRegistry, result: String): Counter =
         Counter.builder("payment.admission")
             .description("Payments admitted to or rejected by the account limiter")
@@ -236,7 +284,7 @@ class PaymentExternalSystemAdapterImpl(
 
         if (percentileWindow != null) {
             builder
-                .publishPercentiles(0.99)
+                .publishPercentiles(0.85, 0.99)
                 .distributionStatisticExpiry(percentileWindow)
                 .distributionStatisticBufferLength(1)
         }
